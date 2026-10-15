@@ -17,8 +17,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-DISCOUNT_THRESHOLD = 0.60  # Hľadáme cenu <= 60 % bežnej ceny
-MIN_PRICE_EUR = 40  # Ignorovať lacné drobnosti pod 40 €
+DISCOUNT_THRESHOLD = 0.60
+MIN_PRICE_EUR = 40
 CSV_OUTPUT = "vyhodne_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
 
@@ -28,9 +28,6 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-# ==========================================
-# 1. PAMÄŤ UŽ VIDENÝCH INZERÁTOV
-# ==========================================
 def load_seen_ads() -> set:
   if not os.path.exists(SEEN_FILE):
     return set()
@@ -46,57 +43,56 @@ def save_seen_ads(seen_set: set):
 
 
 # ==========================================
-# 2. STIAHNUTIE INZERÁTOV Z BAZOŠ.SK
+# STIAHNUTIE POMOCOU PLAYWRIGHT (OBCHÁDZA OCHRANU BAZOŠU)
 # ==========================================
-def fetch_bazos_ads():
-  url = "https://hudba.bazos.sk/"
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      )
-  }
-  response = requests.get(url, headers=headers, timeout=15)
-  response.raise_for_status()
-
-  soup = BeautifulSoup(response.text, "html.parser")
+def fetch_bazos_ads_with_browser(browser_context):
   ads = []
+  page = browser_context.new_page()
+  try:
+    print("Načítavam hudba.bazos.sk cez prehliadač...")
+    page.goto("https://hudba.bazos.sk/", timeout=30000)
+    page.wait_for_selector("div.inzeraty.inzeratflex", timeout=10000)
 
-  for item in soup.select("div.inzeraty.inzeratflex"):
-    title_el = item.select_one("h2.nadpis a")
-    desc_el = item.select_one("div.popis")
-    price_el = item.select_one("div.inzeratycena b")
+    html = page.content()
+    soup = BeautifulSoup(html, "html.parser")
 
-    if not (title_el and desc_el and price_el):
-      continue
+    for item in soup.select("div.inzeraty.inzeratflex"):
+      title_el = item.select_one("h2.nadpis a")
+      desc_el = item.select_one("div.popis")
+      price_el = item.select_one("div.inzeratycena b")
 
-    link = "https://hudba.bazos.sk" + title_el["href"]
-    match = re.search(r"/inzerat/(\d+)/", link)
-    ad_id = match.group(1) if match else link
+      if not (title_el and desc_el and price_el):
+        continue
 
-    price_text = (
-        price_el.get_text(strip=True).replace(" ", "").replace("€", "")
-    )
-    if not price_text.isdigit():
-      continue
+      link = "https://hudba.bazos.sk" + title_el["href"]
+      match = re.search(r"/inzerat/(\d+)/", link)
+      ad_id = match.group(1) if match else link
 
-    price = float(price_text)
-    if price < MIN_PRICE_EUR:
-      continue
+      price_text = (
+          price_el.get_text(strip=True).replace(" ", "").replace("€", "")
+      )
+      if not price_text.isdigit():
+        continue
 
-    ads.append({
-        "id": ad_id,
-        "title": title_el.get_text(strip=True),
-        "description": desc_el.get_text(strip=True),
-        "price": price,
-        "url": link,
-    })
+      price = float(price_text)
+      if price < MIN_PRICE_EUR:
+        continue
+
+      ads.append({
+          "id": ad_id,
+          "title": title_el.get_text(strip=True),
+          "description": desc_el.get_text(strip=True),
+          "price": price,
+          "url": link,
+      })
+  except Exception as e:
+    print(f"Chyba pri sťahovaní Bazošu: {e}")
+  finally:
+    page.close()
 
   return ads
 
 
-# ==========================================
-# 3. AI ANALÝZA INZERÁTU
-# ==========================================
 def parse_ad_with_ai(title: str, description: str) -> dict:
   prompt = f"""
     Analyzuj tento inzerát z Bazošu v kategórii hudobné nástroje.
@@ -123,15 +119,11 @@ def parse_ad_with_ai(title: str, description: str) -> dict:
     return {"is_valid_sale": False, "exact_model": ""}
 
 
-# ==========================================
-# 4. ZISTENIE CIEN (THOMANN / MUZIKER / REVERB)
-# ==========================================
 def get_market_prices(model_query: str, browser_context) -> dict:
   prices = {"thomann_new": None, "muziker_new": None, "reverb_used": None}
   encoded_query = quote_plus(model_query)
   page = browser_context.new_page()
 
-  # --- A) Thomann.de ---
   try:
     thomann_url = (
         f"https://www.thomann.de/intl/search_dir.html?sw={encoded_query}"
@@ -158,7 +150,6 @@ def get_market_prices(model_query: str, browser_context) -> dict:
   except Exception:
     pass
 
-  # --- B) Muziker.sk (Záloha) ---
   if not prices["thomann_new"]:
     try:
       muziker_url = f"https://www.muziker.sk/search?q={encoded_query}"
@@ -175,7 +166,6 @@ def get_market_prices(model_query: str, browser_context) -> dict:
 
   page.close()
 
-  # --- C) Reverb.com API (Použité kusy) ---
   try:
     reverb_url = f"https://api.reverb.com/api/listings?query={encoded_query}&condition=used&per_page=5"
     headers = {
@@ -200,10 +190,9 @@ def get_market_prices(model_query: str, browser_context) -> dict:
   return prices
 
 
-# ==========================================
-# 5. ULOŽENIE ÚLOVKU A NOTIFIKÁCIA
-# ==========================================
-def save_deal(ad: dict, model_name: str, prices: dict, ref_price: float, ratio: float):
+def save_deal(
+    ad: dict, model_name: str, prices: dict, ref_price: float, ratio: float
+):
   file_exists = os.path.isfile(CSV_OUTPUT)
   with open(CSV_OUTPUT, mode="a", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
@@ -244,59 +233,57 @@ def save_deal(ad: dict, model_name: str, prices: dict, ref_price: float, ratio: 
     requests.post(tg_url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
 
 
-# ==========================================
-# JEDNORAZOVÝ BEH PRE GITHUB ACTIONS
-# ==========================================
 def main():
   seen_ads = load_seen_ads()
-  ads = fetch_bazos_ads()
-  new_ads = [ad for ad in ads if ad["id"] not in seen_ads]
-
-  print(f"Stiahnutých {len(ads)} inzerátov, z toho {len(new_ads)} nových.")
-
-  if not new_ads:
-    return
 
   with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     context = browser.new_context(
         user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+            " like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     )
 
-    for ad in new_ads:
-      seen_ads.add(ad["id"])
-      print(f"Analyzujem: {ad['title']} ({ad['price']} €)")
+    ads = fetch_bazos_ads_with_browser(context)
+    new_ads = [ad for ad in ads if ad["id"] not in seen_ads]
 
-      ai_data = parse_ad_with_ai(ad["title"], ad["description"])
-      if not ai_data.get("is_valid_sale") or not ai_data.get("exact_model"):
-        print(" -> Preskakujem (nie je konkrétny nástroj / chýba model).")
-        continue
+    print(f"Stiahnutých {len(ads)} inzerátov, z toho {len(new_ads)} nových.")
 
-      model_name = ai_data["exact_model"]
-      print(f" -> Rozpoznaný model: {model_name}")
+    if new_ads:
+      for ad in new_ads:
+        seen_ads.add(ad["id"])
+        print(f"Analyzujem: {ad['title']} ({ad['price']} €)")
 
-      prices = get_market_prices(model_name, context)
-      ref_price = (
-          prices["thomann_new"]
-          or prices["muziker_new"]
-          or prices["reverb_used"]
-      )
+        ai_data = parse_ad_with_ai(ad["title"], ad["description"])
+        if not ai_data.get("is_valid_sale") or not ai_data.get("exact_model"):
+          print(" -> Preskakujem (nie je konkrétny nástroj / chýba model).")
+          continue
 
-      if not ref_price:
-        print(" -> Nepodarilo sa nájsť referenčnú cenu.")
-        continue
+        model_name = ai_data["exact_model"]
+        print(f" -> Rozpoznaný model: {model_name}")
 
-      ratio = ad["price"] / ref_price
-      print(
-          f" -> Bazoš: {ad['price']} € | Ref: {ref_price} € ({round(ratio * 100, 1)}%)"
-      )
+        prices = get_market_prices(model_name, context)
+        ref_price = (
+            prices["thomann_new"]
+            or prices["muziker_new"]
+            or prices["reverb_used"]
+        )
 
-      if ratio <= DISCOUNT_THRESHOLD:
-        save_deal(ad, model_name, prices, ref_price, ratio)
+        if not ref_price:
+          print(" -> Nepodarilo sa nájsť referenčnú cenu.")
+          continue
 
-      time.sleep(2)
+        ratio = ad["price"] / ref_price
+        print(
+            f" -> Bazoš: {ad['price']} € | Ref: {ref_price} €"
+            f" ({round(ratio * 100, 1)}%)"
+        )
+
+        if ratio <= DISCOUNT_THRESHOLD:
+          save_deal(ad, model_name, prices, ref_price, ratio)
+
+        time.sleep(2)
 
     browser.close()
 
@@ -305,3 +292,4 @@ def main():
 
 if __name__ == "__main__":
   main()
+    
