@@ -44,7 +44,7 @@ def save_seen_ads(seen_set: set):
 
 
 # ==========================================
-# NEPRIESTRELNÉ SŤAHOVANIE BAZOŠU (3 METÓDY)
+# SŤAHOVANIE BAZOŠU (RSS + ZÁLOHY)
 # ==========================================
 def parse_rss_xml(xml_text: str) -> list:
   ads = []
@@ -58,7 +58,6 @@ def parse_rss_xml(xml_text: str) -> list:
       match_id = re.search(r"/inzerat/(\d+)/", link)
       ad_id = match_id.group(1) if match_id else link
 
-      # V RSS je názov v tvare: "Názov inzerátu: 150" alebo "Názov - 150"
       price_match = re.search(r"[:\-]\s*([\d\s]+)$", title_raw.strip())
       if not price_match:
         continue
@@ -88,68 +87,6 @@ def parse_rss_xml(xml_text: str) -> list:
   return ads
 
 
-def parse_html_flexible(html_text: str) -> list:
-  ads = []
-  soup = BeautifulSoup(html_text, "html.parser")
-  seen_in_batch = set()
-
-  # Hľadáme akékoľvek odkazy na inzeráty (nezávisle od CSS tried Bazošu)
-  for a_tag in soup.select('a[href*="/inzerat/"]'):
-    href = a_tag.get("href", "")
-    match_id = re.search(r"/inzerat/(\d+)/", href)
-    if not match_id:
-      continue
-
-    ad_id = match_id.group(1)
-    if ad_id in seen_in_batch:
-      continue
-
-    title = a_tag.get_text(strip=True)
-    if len(title) < 3:
-      continue  # Preskočíme obrázkové odkazy bez textu
-
-    seen_in_batch.add(ad_id)
-    link = (
-        href if href.startswith("http") else f"https://hudba.bazos.sk{href}"
-    )
-
-    container = a_tag.find_parent("div", class_="inzeraty") or a_tag.find_parent(
-        "table"
-    ) or a_tag.parent.parent
-    if not container:
-      continue
-
-    desc_el = container.select_one("div.popis")
-    desc = (
-        desc_el.get_text(" ", strip=True)
-        if desc_el
-        else container.get_text(" ", strip=True)
-    )
-
-    container_text = container.get_text(" ", strip=True)
-    price_match = re.search(r"(\d[\d\s]*)\s*€", container_text)
-    if not price_match:
-      continue
-
-    price_str = price_match.group(1).replace(" ", "").strip()
-    if not price_str.isdigit():
-      continue
-
-    price = float(price_str)
-    if price < MIN_PRICE_EUR:
-      continue
-
-    ads.append({
-        "id": ad_id,
-        "title": title,
-        "description": desc,
-        "price": price,
-        "url": link,
-    })
-
-  return ads
-
-
 def fetch_bazos_ads() -> list:
   headers = {
       "User-Agent": (
@@ -159,7 +96,6 @@ def fetch_bazos_ads() -> list:
       "Accept-Language": "sk-SK,sk;q=0.9,cs;q=0.8,en;q=0.7",
   }
 
-  # 1. Pokus: Priamy RSS kanál Bazošu + Proxy zálohy pre RSS
   rss_urls = [
       "https://www.bazos.sk/rss.php?rub=hu",
       f"https://api.allorigins.win/raw?url={quote_plus('https://www.bazos.sk/rss.php?rub=hu')}",
@@ -178,57 +114,55 @@ def fetch_bazos_ads() -> list:
     except Exception as e:
       print(f" -> RSS pokus zlyhal: {e}")
 
-  # 2. Pokus: HTML stránka priamo + cez Proxy
-  html_urls = [
-      "https://hudba.bazos.sk/",
-      f"https://api.allorigins.win/raw?url={quote_plus('https://hudba.bazos.sk/')}",
-      f"https://corsproxy.io/?{quote_plus('https://hudba.bazos.sk/')}",
-  ]
-
-  for url in html_urls:
-    try:
-      print(f"Skúšam stiahnuť HTML: {url[:45]}...")
-      r = requests.get(url, headers=headers, timeout=15)
-      if r.status_code == 200 and "/inzerat/" in r.text:
-        ads = parse_html_flexible(r.text)
-        if ads:
-          print(f" -> Úspech cez HTML! Nájdených {len(ads)} inzerátov s cenou.")
-          return ads
-    except Exception as e:
-      print(f" -> HTML pokus zlyhal: {e}")
-
   return []
 
 
 # ==========================================
-# AI ANALÝZA A POROVNANIE CIEN
+# AI ANALÝZA (S AUTOMATICKÝM VÝBEROM MODELU)
 # ==========================================
-def parse_ad_with_ai(title: str, description: str) -> dict:
+def parse_ad_with_ai(title: str, description: str) -> dict | None:
   prompt = f"""
     Analyzuj tento inzerát z Bazošu v kategórii hudobné nástroje.
     Nadpis: {title}
     Popis: {description}
 
     Vráť JSON s týmito poľami:
-    - "is_valid_sale": true ak ide o predaj jedného konkrétneho hudobného nástroja alebo techniky (gitara, klávesy, syntetizátor, kombo, bicie, mikrofón, efekt). Daj false, ak ide o dopyt ("Kúpim"), prenájom, výučbu, nefunkčný kus na diely, samotný obal/kufor, alebo zoznam viacerých rôznych vecí v jednom inzeráte.
-    - "exact_model": Presný názov značky a modelu vhodný na vyhľadanie v e-shope Thomann.de (napr. "Fender Player Stratocaster", "Yamaha P-45", "Boss Katana 50 MkII"). Ak sa presný model nedá určiť, vráť "".
+    - "is_valid_sale": true ak ide o predaj jedného konkrétneho hudobného nástroja alebo techniky (gitara, klávesy, syntetizátor, kombo, bicie, mikrofón, efekt, mixpult, reprobox). Daj false, ak ide o dopyt ("Kúpim"), prenájom, výučbu, nefunkčný kus na diely, samotný obal/kufor, alebo zoznam viacerých rôznych vecí v jednom inzeráte.
+    - "exact_model": Presný názov značky a modelu vhodný na vyhľadanie v e-shope Thomann.de (napr. "Fender American Professional II Stratocaster", "Yamaha PSR-E443", "Pioneer DDJ-400"). Ak sa presný model nedá určiť, vráť "".
     """
 
-  try:
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
-    )
-    return json.loads(response.text)
-  except Exception as e:
-    print(f"[AI Chyba]: {e}")
-    return {"is_valid_sale": False, "exact_model": ""}
+  # Skúsime modely od najnovšieho po záložné
+  models_to_try = [
+      "gemini-3.8-flash",
+      "gemini-3-flash-preview",
+      "gemini-2.0-flash",
+  ]
+
+  for model_name in models_to_try:
+    try:
+      response = client.models.generate_content(
+          model=model_name,
+          contents=prompt,
+          config=types.GenerateContentConfig(
+              response_mime_type="application/json",
+              temperature=0.1,
+          ),
+      )
+      return json.loads(response.text)
+    except Exception as e:
+      err_str = str(e)
+      if "404" in err_str or "NOT_FOUND" in err_str:
+        continue  # Skúsi ďalší model v zozname
+      print(f"[AI Chyba ({model_name})]: {e}")
+      return None
+
+  print("[AI Chyba]: Žiadny z modelov nefungoval.")
+  return None
 
 
+# ==========================================
+# POROVNANIE CIEN (THOMANN / MUZIKER / REVERB)
+# ==========================================
 def get_market_prices(model_query: str, browser_context) -> dict:
   prices = {"thomann_new": None, "muziker_new": None, "reverb_used": None}
   encoded_query = quote_plus(model_query)
@@ -363,10 +297,16 @@ def main():
     )
 
     for ad in new_ads:
-      seen_ads.add(ad["id"])
       print(f"Analyzujem: {ad['title']} ({ad['price']} €)")
 
       ai_data = parse_ad_with_ai(ad["title"], ad["description"])
+      if ai_data is None:
+        print(" -> AI zlyhalo, nechávam inzerát na ďalší pokus.")
+        continue
+
+      # Označíme ako videný až keď AI úspešne odpovedala
+      seen_ads.add(ad["id"])
+
       if not ai_data.get("is_valid_sale") or not ai_data.get("exact_model"):
         print(" -> Preskakujem (nie je konkrétny nástroj / chýba model).")
         continue
@@ -394,7 +334,7 @@ def main():
       if ratio <= DISCOUNT_THRESHOLD:
         save_deal(ad, model_name, prices, ref_price, ratio)
 
-      time.sleep(2)
+      time.sleep(3)
 
     browser.close()
 
