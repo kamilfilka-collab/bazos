@@ -18,7 +18,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-DISCOUNT_THRESHOLD = 0.60
+DISCOUNT_THRESHOLD = 0.60  # Hľadáme cenu <= 60 % bežnej ceny
 MIN_PRICE_EUR = 40
 CSV_OUTPUT = "vyhodne_inzeraty.csv"
 SEEN_FILE = "seen_ads.txt"
@@ -44,7 +44,7 @@ def save_seen_ads(seen_set: set):
 
 
 # ==========================================
-# SŤAHOVANIE BAZOŠU (RSS + ZÁLOHY)
+# 1. SŤAHOVANIE BAZOŠU CEZ RSS
 # ==========================================
 def parse_rss_xml(xml_text: str) -> list:
   ads = []
@@ -118,55 +118,91 @@ def fetch_bazos_ads() -> list:
 
 
 # ==========================================
-# AI ANALÝZA (S AUTOMATICKÝM VÝBEROM MODELU)
+# 2. HROMADNÁ AI ANALÝZA (VŠETKY INZERÁTY V 1 OTÁZKE)
 # ==========================================
-def parse_ad_with_ai(title: str, description: str) -> dict | None:
-  prompt = f"""
-    Analyzuj tento inzerát z Bazošu v kategórii hudobné nástroje.
-    Nadpis: {title}
-    Popis: {description}
-
-    Vráť JSON s týmito poľami:
-    - "is_valid_sale": true ak ide o predaj jedného konkrétneho hudobného nástroja alebo techniky (gitara, klávesy, syntetizátor, kombo, bicie, mikrofón, efekt, mixpult, reprobox). Daj false, ak ide o dopyt ("Kúpim"), prenájom, výučbu, nefunkčný kus na diely, samotný obal/kufor, alebo zoznam viacerých rôznych vecí v jednom inzeráte.
-    - "exact_model": Presný názov značky a modelu vhodný na vyhľadanie v e-shope Thomann.de (napr. "Fender American Professional II Stratocaster", "Yamaha PSR-E443", "Pioneer DDJ-400"). Ak sa presný model nedá určiť, vráť "".
-    """
-
-  # Skúsime modely od najnovšieho po záložné
-  models_to_try = [
-      "gemini-3.8-flash",
-      "gemini-3-flash-preview",
-      "gemini-2.0-flash",
+def parse_ads_batch_with_ai(ads: list) -> dict | None:
+  items_for_prompt = [
+      {"id": a["id"], "title": a["title"], "description": a["description"][:300]}
+      for a in ads
   ]
 
-  for model_name in models_to_try:
+  prompt = f"""
+    Analyzuj tento zoznam inzerátov z Bazošu v kategórii hudobné nástroje:
+    {json.dumps(items_for_prompt, ensure_ascii=False)}
+
+    Pre každý inzerát vráť objekt v JSON poli (zozname) s týmito poľami:
+    - "id": rovnaké ID inzerátu ako na vstupe
+    - "is_valid_sale": true ak ide o predaj jedného konkrétneho hudobného nástroja alebo techniky (gitara, klávesy, syntetizátor, kombo, bicie, mikrofón, efekt, mixpult, reprobox). Daj false, ak ide o dopyt ("Kúpim"), prenájom, výučbu, nefunkčný kus na diely, samotný obal/kufor, alebo nešpecifikovaný nástroj bez značky (napr. len "B trúbka", "Violončelo 4/4", "Digitálny mix").
+    - "exact_model": Presný názov značky a modelu vhodný na vyhľadanie v e-shope Thomann.de (napr. "Fender American Professional II Stratocaster", "Yamaha PSR-E443", "Pioneer DDJ-400"). Ak sa presná značka a model nedá určiť, vráť "".
+    """
+
+  for attempt in range(3):
     try:
+      print("Posielam všetky inzeráty naraz do AI na analýzu...")
       response = client.models.generate_content(
-          model=model_name,
+          model="gemini-3.8-flash",
           contents=prompt,
           config=types.GenerateContentConfig(
               response_mime_type="application/json",
               temperature=0.1,
           ),
       )
-      return json.loads(response.text)
+      parsed_list = json.loads(response.text)
+      return {str(item.get("id")): item for item in parsed_list}
     except Exception as e:
-      err_str = str(e)
-      if "404" in err_str or "NOT_FOUND" in err_str:
-        continue  # Skúsi ďalší model v zozname
-      print(f"[AI Chyba ({model_name})]: {e}")
-      return None
+      print(f"[AI Pokus {attempt + 1}/3 zlyhal]: {e}")
+      time.sleep(12)  # Ak je server vyťažený, počkáme 12 sekúnd a skúsime znova
 
-  print("[AI Chyba]: Žiadny z modelov nefungoval.")
   return None
 
 
 # ==========================================
-# POROVNANIE CIEN (THOMANN / MUZIKER / REVERB)
+# 3. SPRÁVNE ČÍTANIE EURÓPSKYCH CIEN (napr. 1.479 € -> 1479.0)
+# ==========================================
+def parse_euro_price(raw_text: str) -> float | None:
+  cleaned = re.sub(r"[^\d.,]", "", raw_text).strip(".,")
+  if not cleaned:
+    return None
+
+  if "," in cleaned and "." in cleaned:
+    if cleaned.rfind(",") > cleaned.rfind("."):
+      # Formát 1.479,00
+      cleaned = cleaned.replace(".", "").replace(",", ".")
+    else:
+      # Formát 1,479.00
+      cleaned = cleaned.replace(",", "")
+  elif "." in cleaned:
+    parts = cleaned.split(".")
+    # Ak sú za bodkou presne 3 číslice (napr. 1.479), ide o tisíce!
+    if len(parts[-1]) == 3:
+      cleaned = cleaned.replace(".", "")
+  elif "," in cleaned:
+    parts = cleaned.split(",")
+    if len(parts[-1]) == 3:
+      cleaned = cleaned.replace(",", "")
+    else:
+      cleaned = cleaned.replace(",", ".")
+
+  try:
+    return float(cleaned)
+  except ValueError:
+    return None
+
+
+# ==========================================
+# 4. ZISTENIE CIEN (THOMANN / MUZIKER / REVERB)
 # ==========================================
 def get_market_prices(model_query: str, browser_context) -> dict:
   prices = {"thomann_new": None, "muziker_new": None, "reverb_used": None}
   encoded_query = quote_plus(model_query)
   page = browser_context.new_page()
+
+  # Slová príslušenstva a náhradných dielov, ktoré musíme preskočiť
+  bad_words = [
+      "bag", "case", "cover", "deck", "stand", "strap", "cable", "power supply",
+      "pickup", "neck", "guard", "bridge", "capsule", "earpad", "foam", "adapter",
+      "foam", "module", "holder", "mount", "knob", "string", "tuning",
+  ]
 
   try:
     thomann_url = (
@@ -175,21 +211,17 @@ def get_market_prices(model_query: str, browser_context) -> dict:
     page.goto(thomann_url, timeout=15000)
     page.wait_for_selector("div.product", timeout=5000)
 
-    products = page.query_selector_all("div.product")[:3]
+    products = page.query_selector_all("div.product")[:5]
     for prod in products:
       title_el = prod.query_selector(".product__title")
       price_el = prod.query_selector(".fx-typography-price-primary")
       if title_el and price_el:
         prod_title = title_el.inner_text().lower()
-        if any(
-            bad in prod_title
-            for bad in ["bag", "case", "cover", "deck", "stand", "strap"]
-        ):
+        if any(bad in prod_title for bad in bad_words):
           continue
-        raw_price = price_el.inner_text()
-        clean_price = re.sub(r"[^\d,]", "", raw_price).replace(",", ".")
-        if clean_price:
-          prices["thomann_new"] = float(clean_price)
+        val = parse_euro_price(price_el.inner_text())
+        if val:
+          prices["thomann_new"] = val
           break
   except Exception:
     pass
@@ -201,10 +233,9 @@ def get_market_prices(model_query: str, browser_context) -> dict:
       page.wait_for_selector(".product-tile", timeout=5000)
       price_el = page.query_selector(".product-tile .price")
       if price_el:
-        raw_price = price_el.inner_text()
-        clean_price = re.sub(r"[^\d,]", "", raw_price).replace(",", ".")
-        if clean_price:
-          prices["muziker_new"] = float(clean_price)
+        val = parse_euro_price(price_el.inner_text())
+        if val:
+          prices["muziker_new"] = val
     except Exception:
       pass
 
@@ -287,6 +318,12 @@ def main():
   if not new_ads:
     return
 
+  # Hromadná AI analýza v jednom kroku
+  ai_results = parse_ads_batch_with_ai(new_ads)
+  if ai_results is None:
+    print("AI analýza momentálne zlyhala, skúsim pri ďalšom behu.")
+    return
+
   with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     context = browser.new_context(
@@ -297,15 +334,10 @@ def main():
     )
 
     for ad in new_ads:
-      print(f"Analyzujem: {ad['title']} ({ad['price']} €)")
-
-      ai_data = parse_ad_with_ai(ad["title"], ad["description"])
-      if ai_data is None:
-        print(" -> AI zlyhalo, nechávam inzerát na ďalší pokus.")
-        continue
-
-      # Označíme ako videný až keď AI úspešne odpovedala
       seen_ads.add(ad["id"])
+      ai_data = ai_results.get(str(ad["id"]), {})
+
+      print(f"Analyzujem: {ad['title']} ({ad['price']} €)")
 
       if not ai_data.get("is_valid_sale") or not ai_data.get("exact_model"):
         print(" -> Preskakujem (nie je konkrétny nástroj / chýba model).")
@@ -325,6 +357,10 @@ def main():
         print(" -> Nepodarilo sa nájsť referenčnú cenu.")
         continue
 
+      # Ochrana: ak je cena na e-shope podozrivo nízka oproti Bazošu (napr. našlo len drobný diel), skúsime Reverb
+      if ref_price < ad["price"] * 0.35 and prices["reverb_used"]:
+        ref_price = prices["reverb_used"]
+
       ratio = ad["price"] / ref_price
       print(
           f" -> Bazoš: {ad['price']} € | Ref: {ref_price} €"
@@ -334,7 +370,7 @@ def main():
       if ratio <= DISCOUNT_THRESHOLD:
         save_deal(ad, model_name, prices, ref_price, ratio)
 
-      time.sleep(3)
+      time.sleep(2)
 
     browser.close()
 
