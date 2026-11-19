@@ -38,6 +38,6 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_ads.txt vyhodne_inzeraty.csv || true
-          git diff --staged --quiet || git commit -m "Aktualizácia inzerátov [skip ci]"
-          git push
+          [ -f seen_ads.txt ] && git add seen_ads.txt
+          [ -f vyhodne_inzeraty.csv ] && git add vyhodne_inzeraty.csv
+          git diff --staged --quiet || (git commit -m "Aktualizácia inzerátov [skip ci]" && git pull --rebase && git push)
