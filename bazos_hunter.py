@@ -20,7 +20,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Model Gemini (opravený názov)
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 # LOGIKA MOŽNOSTI A (Porovnávanie voči reálnej BAZAROVEJ cene):
 # 1. Ak poznáme cenu novej gitary, jej bežná bazarová hodnota je ~70 % ceny novej.
